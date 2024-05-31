@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from tqdm import tqdm
 from faster_whisper import WhisperModel  
+from finetune_whisperx import WhisperXTranscribe
 # Use a local Tokenizer to resolve Japanese support
 # from TTS.tts.layers.xtts.tokenizer import multilingual_cleaners
 from system.ft_tokenizer.tokenizer import multilingual_cleaners
@@ -291,7 +292,7 @@ def create_temporary_file(folder, suffix=".wav"):
     unique_filename = f"custom_tempfile_{int(time.time())}_{random.randint(1, 1000)}{suffix}"
     return os.path.join(folder, unique_filename)
 
-def format_audio_list(target_language, whisper_model, out_path, eval_split_number, speaker_name_input, gradio_progress=progress):
+def format_audio_list(target_language, whisper_model, out_path, eval_split_number, speaker_name_input, whisperx_batch_size, whisperx_alignment, use_whisperx, gradio_progress=progress):
     pfc_check_fail()
     audio_files = [os.path.join(audio_folder, file) for file in os.listdir(audio_folder) if file.endswith(('.mp3', '.flac', '.wav'))]
     buffer=0.2
@@ -328,7 +329,11 @@ def format_audio_list(target_language, whisper_model, out_path, eval_split_numbe
 
     print("[FINETUNE] Loading Whisper Model:", whisper_model)
     print("[FINETUNE] Model will be downloaded if its not available, which will take a few minutes.")
-    asr_model = WhisperModel(whisper_model, device=device, compute_type="float32")
+
+    if(use_whisperx):
+        whisperx = WhisperXTranscribe(whisper_model, target_language, device, whisperx_alignment)
+    else:
+        asr_model = WhisperModel(whisper_model, device=device, compute_type="float32")
 
     metadata = {"audio_file": [], "text": [], "speaker_name": []}
 
@@ -403,25 +408,30 @@ def format_audio_list(target_language, whisper_model, out_path, eval_split_numbe
         if skip_processing:
             continue
 
+        # added all segments words in a unique list
+        words_list = []
+
         wav, sr = torchaudio.load(audio_path)
         # stereo to mono if needed
         if wav.size(0) != 1:
             wav = torch.mean(wav, dim=0, keepdim=True)
-
         wav = wav.squeeze()
         audio_total_size += (wav.size(-1) / sr)
 
-        segments, _ = asr_model.transcribe(audio_path, vad_filter=True, word_timestamps=True, language=target_language)
-        segments = list(segments)
+        if(use_whisperx):
+            whisperx.transcribeWhisperX(audio_path, whisperx_batch_size, wav, words_list)
+        else:
+            segments, _ = asr_model.transcribe(audio_path, vad_filter=True, word_timestamps=True,language=target_language)
+            segments = list(segments)
+            for _, segment in enumerate(segments):
+                words = list(segment.words)
+                words_list.extend(words)
+
         i = 0
         sentence = ""
         sentence_start = None
         first_word = True
-        # added all segments words in a unique list
-        words_list = []
-        for _, segment in enumerate(segments):
-            words = list(segment.words)
-            words_list.extend(words)
+        print(f" [FINETUNE] words list {words_list}")
 
         # process each word
         for word_idx, word in enumerate(words_list):
@@ -475,6 +485,9 @@ def format_audio_list(target_language, whisper_model, out_path, eval_split_numbe
                 else:
                     continue
 
+                print(f" [FINETUNE] metadata complete {metadata}")
+                print(f" [FINETUNE] audio file complete {audio_file}")
+
                 metadata["audio_file"].append(audio_file)
                 metadata["text"].append(sentence)
                 metadata["speaker_name"].append(speaker_name)
@@ -503,7 +516,11 @@ def format_audio_list(target_language, whisper_model, out_path, eval_split_numbe
     final_eval_set.sort_values('audio_file').to_csv(eval_metadata_path, sep='|', index=False)
 
     # deallocate VRAM and RAM
-    del asr_model, final_eval_set, final_training_set, new_data_df, existing_metadata
+    if (use_whisperx):
+        whisperx.deleteWhisperX()
+        del final_eval_set, final_training_set, new_data_df, existing_metadata
+    else:
+        del asr_model, final_eval_set, final_training_set, new_data_df, existing_metadata
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1368,11 +1385,32 @@ if __name__ == "__main__":
                     maximum=95,  # Maximum value
                     step=1,  # Increment step
                 )
+
                 speaker_name_input = gr.Textbox(
-                label="The name of the speaker/person you are training",
-                value="personsname",
-                visible=True,
-            )
+                    label="The name of the speaker/person you are training",
+                    value="personsname",
+                    visible=True,
+                )
+
+            with gr.Row():
+                use_whisperx = gr.Checkbox(
+                    label='WhisperX',
+                    value=False
+                )
+
+                whisperx_batch_size = gr.Slider(
+                    label="WhisperX Batch size:",
+                    minimum=2,
+                    maximum=128,
+                    step=1,
+                    value=16,
+                )
+
+                whisperx_alignment = gr.Checkbox(
+                    label='WhisperX Alignment',
+                    value=True
+                )
+
             progress_data = gr.Label(
                 label="Progress:"
             )
@@ -1384,7 +1422,7 @@ if __name__ == "__main__":
 
             prompt_compute_btn = gr.Button(value="Step 1 - Create dataset")
         
-            def preprocess_dataset(language, whisper_model, out_path, eval_split_number, speaker_name_input, progress=gr.Progress(track_tqdm=True)):
+            def preprocess_dataset(language, whisper_model, out_path, eval_split_number, speaker_name_input, whisperx_batch_size, whisperx_alignment, use_whisperx, progress=gr.Progress(track_tqdm=True)):
                 clear_gpu_cache()
                 test_for_audio_files = [file for file in os.listdir(audio_folder) if any(file.lower().endswith(ext) for ext in ['.wav', '.mp3', '.flac'])]
                 if not test_for_audio_files:
@@ -1392,7 +1430,7 @@ if __name__ == "__main__":
                 else:
                     try:
 
-                        train_meta, eval_meta, audio_total_size = format_audio_list(target_language=language, whisper_model=whisper_model, out_path=out_path, eval_split_number=eval_split_number, speaker_name_input=speaker_name_input, gradio_progress=progress)
+                        train_meta, eval_meta, audio_total_size = format_audio_list(target_language=language, whisper_model=whisper_model, out_path=out_path, eval_split_number=eval_split_number, speaker_name_input=speaker_name_input, whisperx_batch_size=whisperx_batch_size, whisperx_alignment=whisperx_alignment, use_whisperx=use_whisperx, gradio_progress=progress)
                     except:
                         traceback.print_exc()
                         error = traceback.format_exc()
@@ -1808,6 +1846,9 @@ if __name__ == "__main__":
                     out_path,
                     eval_split_number,
                     speaker_name_input,
+                    whisperx_batch_size,
+                    whisperx_alignment,
+                    use_whisperx,
                 ],
                 outputs=[
                     progress_data,

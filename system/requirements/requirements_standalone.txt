@@ -37,6 +37,7 @@ docopt==0.6.2
 einops==0.7.0
 encodec==0.1.1
 fastapi==0.110.0
+whisperx @ git+https://github.com/m-bain/whisperx.git
 faster-whisper==1.0.1
 ffmpy==0.3.2
 filelock==3.13.3
