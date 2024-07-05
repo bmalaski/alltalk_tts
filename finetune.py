@@ -38,6 +38,8 @@ from packaging import version
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.pre_tokenizers import Whitespace
 
+from trainer_alltalk.AllTalkTrainer import AllTalkTrainer
+
 # STARTUP VARIABLES 
 this_dir = Path(__file__).parent.resolve()
 audio_folder = this_dir / "finetune" / "put-voice-samples-in-here"
@@ -951,11 +953,11 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
         lr_scheduler=lr_scheduler,
         # it was adjusted accordly for the new step scheme
         lr_scheduler_params=lr_scheduler_params,
-        test_sentences=[],
+        test_sentences=[]
     )
     progress(0, desc="Model is currently training. See console for more information")
     # init the model from config
-    model = GPTTrainer.init_from_config(config)
+    model = AllTalkTrainer(config)
     # load training samples
     train_samples, eval_samples = load_tts_samples(
         DATASETS_CONFIG_LIST,
@@ -984,7 +986,8 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
         training_assets=training_assets,
         c_logger=c_logger,
         warmup=warm_up,
-
+        ds_enabled=True,
+        aggressive_clean=False
     )
 
     if(disable_shared_memory):
@@ -1013,7 +1016,7 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
     try:
         return XTTS_CONFIG_FILE, XTTS_CHECKPOINT, TOKENIZER_FILE, trainer_out_path, speaker_ref
     except Exception as e:
-        print(f"Error returning values: {e}")
+        print(f"Error returning values:", e)
         return "Error", "Error", "Error", "Error", "Error"
 
 ##########################
@@ -1793,7 +1796,7 @@ if __name__ == "__main__":
                         )
                         warm_up = gr.Checkbox(
                             value=False,
-                            label="Perform Small a Warmup Learning",
+                            label="Perform Small a Warmup",
                             scale=1,
                         )
                     train_csv = gr.Textbox(
@@ -1950,6 +1953,7 @@ if __name__ == "__main__":
                     except Exception as e:
                         # This will catch any other unexpected errors
                         error_message = f"An unexpected error occurred: {str(e)}"
+                        traceback.print_exc()
                         print(f"[FINETUNE] Error: {error_message}")
                         return f"Training error: {error_message}", "", "", "", "", ""
                 

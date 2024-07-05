@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import gc
 import importlib
+import json
 import logging
 import os
 import platform
@@ -11,19 +12,18 @@ import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from inspect import signature
+from trainer.logging import ConsoleLogger, DummyLogger, logger_factory
 from typing import Callable, Dict, List, Tuple, Union
 
+import deepspeed
 import torch
 import torch.distributed as dist
 from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTTrainerConfig, GPTArgs, XttsAudioConfig
 from coqpit import Coqpit
-import json
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP_th
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-
-from trainer.analytics import ping_training_run
 from trainer.callbacks import TrainerCallback
 from trainer.generic_utils import (
     KeepAverage,
@@ -42,7 +42,6 @@ from trainer.io import (
     save_best_model,
     save_checkpoint,
 )
-from trainer.logging import ConsoleLogger, DummyLogger, logger_factory
 from trainer.trainer_utils import (
     get_optimizer,
     get_scheduler,
@@ -312,6 +311,9 @@ class Trainer:
         callbacks: Dict[str, Callable] = {},
         gpu: int = None,
         warmup: bool = False,
+        aggressive_clean: bool = False,
+        ds_enabled: bool = False,
+        ds_config: Dict = {}
     ) -> None:
         """Simple yet powerful 🐸💬 TTS trainer for PyTorch. It can train all the available `tts` and `vocoder` models
         or easily be customized.
@@ -433,7 +435,9 @@ class Trainer:
         self.skip_train_epoch = args.skip_train_epoch
         self.start_with_eval = args.start_with_eval
         self.warmup = warmup
-
+        self.aggressive_clean = aggressive_clean
+        self.ds_enabled = ds_enabled
+        self.ds_config = ds_config
         assert self.grad_accum_steps > 0, " [!] grad_accum_steps must be greater than 0."
 
         # setup logging
@@ -567,21 +571,147 @@ class Trainer:
             )
             self.scaler = torch.cuda.amp.GradScaler()
 
-        # setup scheduler
-        self.scheduler = self.get_scheduler(self.model, self.config, self.optimizer)
-        self.scheduler = self.restore_scheduler(
-            self.scheduler, self.args, self.config, self.restore_epoch, self.restore_step
-        )
+        self.model = torch.
 
-        if self.warmup:
-            warmup_scheduler = WarmUpScheduler(
-                optimizer=self.optimizer,
-                total_epochs=self.config.epochs,
-                warmup_lr=1e-7,
-                target_lr=self.config.lr,
-                after_scheduler=self.scheduler
+
+        if self.ds_enabled:
+            #We need ot setup the loaders first
+            self.train_loader = self.get_train_dataloader(
+                self.training_assets,
+                self.train_samples,
+                verbose=True,
             )
-            self.scheduler = warmup_scheduler
+
+            self.eval_loader = (
+                self.get_eval_dataloader(
+                    self.training_assets,
+                    self.eval_samples,
+                    verbose=True,
+                )
+                if self.config.run_eval
+                else None
+            )
+
+            #deepspeed.ops.op_builder.CPUAdamBuilder().load()
+
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = '12355'
+            os.environ['LOCAL_RANK'] = '0'
+            os.environ["DS_ACCELERATOR"] = 'cuda'
+            torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1, init_method='env://')
+            print(f"loader size: {len(self.train_loader)}")
+            batches = len(self.train_loader)
+            total_steps = batches * self.config.epochs
+
+            if self.ds_config == {}:
+                self.ds_config = {
+                    "train_micro_batch_size_per_gpu": self.config.batch_size,
+                    "gradient_accumulation_steps": self.grad_accum_steps,
+                    "optimizer": {
+                        "type": "Adam",
+                        "params": {
+                            "lr": self.config.lr,
+                            "betas": [0.9, 0.999],
+                            "eps": 1e-8,
+                            "weight_decay": 3e-7
+                        }
+                    },
+                    "flops_profiler": {
+                        "enabled": False,
+                    },
+                    "scheduler": {
+                        "type": "WarmupCosineLR",
+                        "params": {
+                            "warmup_num_steps": batches // self.grad_accum_steps,
+                            "total_num_steps": total_steps // self.grad_accum_steps,
+                            "warmup_min_ratio": 1e-8
+                        }
+                    },
+                    "fp16": {
+                        "enabled": False,
+                        "auto_cast": True,
+                        "loss_scale": 0,
+                        "loss_scale_window": 1000,
+                        "hysteresis": 2,
+                        "min_loss_scale": 1,
+                    },
+                    "zero_optimization": {
+                        "stage": 1,
+                        "offload_optimizer": {
+                            "device": "cpu",
+                            "pin_memory": True
+                        },
+                        "offload_param": {
+                            "device": "cpu",
+                            "pin_memory": True
+                        },
+                        "allgather_partitions": True,
+                        "allgather_bucket_size": 2e8,
+                        "reduce_scatter": True,
+                        "reduce_bucket_size": 2e8,
+                        "overlap_comm": True,
+                        "contiguous_gradients": True
+                    },
+                    "activation_checkpointing_config": {
+                        "cpu_checkpointing": True,
+                        "contiguous_memory_optimization": True,
+                        "profile": True
+                    },
+                    "tensorboard": {
+                        "enabled": True,
+                        "output_path": os.path.join(output_path, "ds_logs"),
+                        "job_name": "training"
+                    },
+                    "distributed_backend": "gloo",
+                    "wall_clock_breakdown": False,
+                    "accelerator": "cuda",
+                    "steps_per_print": self.config.print_step,
+                }
+
+            print(self.model.named_modules())
+            print("_________________________________________________________________")
+
+            ds_logger = logging.getLogger("deepspeed")
+            ds_logger.setLevel(logging.INFO)
+
+            # Create file handler and set level to info
+            file_handler = logging.FileHandler(os.path.join(output_path, "deepspeed.txt"))
+            file_handler.setLevel(logging.INFO)
+
+            # Create formatter
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+            # Add formatter to file handler
+            file_handler.setFormatter(formatter)
+
+            # Add file handler to logger
+            ds_logger.addHandler(file_handler)
+
+            deepspeed.utils.logging.logger = ds_logger
+
+            self.model, self.optimizer, _ , self.scheduler = deepspeed.initialize(
+                model=self.model,
+                model_parameters=self.model.parameters(),
+                config=self.ds_config,
+                dist_init_required=False
+            )
+
+        else:
+            # setup scheduler
+            self.scheduler = self.get_scheduler(self.model, self.config, self.optimizer)
+            self.scheduler = self.restore_scheduler(
+                self.scheduler, self.args, self.config, self.restore_epoch, self.restore_step
+            )
+
+            if self.warmup:
+                warmup_scheduler = WarmUpScheduler(
+                    optimizer=self.optimizer,
+                    total_epochs=self.config.epochs,
+                    warmup_lr=1e-7,
+                    target_lr=self.config.lr,
+                    after_scheduler=self.scheduler
+                )
+                self.scheduler = warmup_scheduler
 
         # DISTRIBUTED
         if self.use_pt_ddp:
@@ -590,6 +720,8 @@ class Trainer:
         # setup accelerator
         self.setup_accelerate()
 
+
+
         # count model size
         num_params = count_parameters(self.model)
         rank_zero_logger_info(f"\n > Model has {num_params} parameters", logger)
@@ -597,7 +729,6 @@ class Trainer:
         self.callbacks.on_init_end(self)
         self.dashboard_logger.add_config(config)
         self.save_training_script()
-        ping_training_run()
 
     @property
     def use_apex(self):
@@ -676,8 +807,10 @@ class Trainer:
 
         return model, optimizer, training_dataloader, scheduler, accelerator
 
+
     def save_training_script(self):
         """Save the training script to tracking dashboard and output path."""
+
         file_path = sys.argv[0]
         if os.path.isfile(file_path):
             file_name = os.path.basename(file_path)
@@ -1107,6 +1240,10 @@ class Trainer:
         try:
             if self.num_gpus > 1:
                 batch = self.model.module.format_batch_on_device(batch)
+            elif self.config.mixed_precision:
+                device, dtype = self._get_autocast_args(self.config.mixed_precision, self.config.precision)
+                with torch.autocast(device_type=device, dtype=dtype):
+                    batch = self.model.format_batch_on_device(batch)
             else:
                 batch = self.model.format_batch_on_device(batch)
         except NotImplementedError:
@@ -1225,40 +1362,19 @@ class Trainer:
         return grad_norm
 
     def optimize(
-        self,
-        batch: Dict,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scaler: "AMPScaler",
-        criterion: nn.Module,
-        scheduler: Union[torch.optim.lr_scheduler._LRScheduler, List, Dict],  # pylint: disable=protected-access
-        config: Coqpit,
-        optimizer_idx: int = None,
-        step_optimizer: bool = True,
-        num_optimizers: int = 1,
+            self,
+            batch: Dict,
+            model: nn.Module,
+            optimizer: torch.optim.Optimizer,
+            scaler: "AMPScaler",
+            criterion: nn.Module,
+            scheduler: Union[torch.optim.lr_scheduler._LRScheduler, List, Dict],  # pylint: disable=protected-access
+            config: Coqpit,
+            optimizer_idx: int = None,
+            step_optimizer: bool = True,
+            num_optimizers: int = 1,
     ) -> Tuple[Dict, Dict, int]:
-        """Perform a forward - backward pass and run the optimizer.
-
-        Args:
-            batch (Dict): Input batch. If
-            model (nn.Module): Model for training. Defaults to None.
-            optimizer (Union[nn.optim.Optimizer, List]): Model's optimizer. If it is a list then, `optimizer_idx` must be defined to indicate the optimizer in use.
-            scaler (AMPScaler): AMP scaler.
-            criterion (nn.Module): Model's criterion.
-            scheduler (torch.optim.lr_scheduler._LRScheduler): LR scheduler used by the optimizer.
-            config (Coqpit): Model config.
-            optimizer_idx (int, optional): Target optimizer being used. Defaults to None.
-            step_optimizer (bool, optional): Whether step the optimizer. If False, gradients are accumulated and
-                model parameters are not updated. Defaults to True.
-            num_optimizers (int, optional): Number of optimizers. Defaults to 1.
-
-        Raises:
-            RuntimeError: When the loss is NaN.
-
-        Returns:
-            Tuple[Dict, Dict, int, torch.Tensor]: model outputs, losses, step time and gradient norm.
-        """
-
+        """Perform a forward - backward pass and run the optimizer."""
         step_start_time = time.time()
 
         # forward pass and loss computation
@@ -1280,7 +1396,8 @@ class Trainer:
         self.callbacks.before_backward_pass(self, loss_dict)
 
         # accumulated gradients adjustment
-        loss_dict["loss"] = loss_dict["loss"] / float(self.grad_accum_steps)
+        if not self.ds_enabled:
+            loss_dict["loss"] = loss_dict["loss"] / float(self.grad_accum_steps)
 
         if self.use_accelerate:
             with self.accelerator.accumulate(model):
@@ -1294,52 +1411,40 @@ class Trainer:
                     if not self.config.scheduler_after_epoch and not self.accelerator.optimizer_step_was_skipped:
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+        elif self.ds_enabled:
+            self.model.backward(loss_dict["loss"])
+            self.model.step()
         else:
             if self.use_amp_scaler:
                 if self.use_apex:
-                    # TODO: verify AMP use for GAN training in TTS
-                    # https://nvidia.github.io/apex/advanced.html?highlight=accumulate#backward-passes-with-multiple-optimizers
                     with amp.scale_loss(loss_dict["loss"], optimizer) as scaled_loss:
                         scaled_loss.backward()
                     if step_optimizer:
                         grad_norm = self._grad_clipping(grad_clip=grad_clip, optimizer=optimizer, scaler=None)
                 else:
-                    # model optimizer step in mixed precision mode
                     scaler.scale(loss_dict["loss"]).backward()
-                    # gradient accumulation
                     if step_optimizer:
                         grad_norm = self._grad_clipping(grad_clip=grad_clip, optimizer=optimizer, scaler=scaler)
                         scale_prev = scaler.get_scale()
                         scaler.step(optimizer)
-                        # update the scaler at the end of all the optimizer steps
                         if optimizer_idx is None or (optimizer_idx + 1 == num_optimizers):
                             scaler.update()
                             loss_dict["amp_scaler"] = scaler.get_scale()  # for logging
                         update_lr_scheduler = scale_prev <= scaler.get_scale()
             else:
-                # main model optimizer step
                 loss_dict["loss"].backward()
-                # gradient accumulation
                 if step_optimizer:
                     self.callbacks.before_gradient_clipping(self)
                     if grad_clip > 0:
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.master_params(optimizer), grad_clip)
                     optimizer.step()
 
-            # setup lr
-            if (
-                scheduler is not None
-                and update_lr_scheduler
-                and not self.config.scheduler_after_epoch
-                and step_optimizer
-            ):
+            if scheduler is not None and update_lr_scheduler and not self.config.scheduler_after_epoch and step_optimizer and not self.ds_enabled:
                 scheduler.step()
 
-            # zero-out optimizer
-            if step_optimizer:
+            if step_optimizer and not self.ds_enabled:
                 optimizer.zero_grad(set_to_none=True)
 
-        # pytorch skips the step when the norm is 0. So ignore the norm value when it is NaN
         if isinstance(grad_norm, torch.Tensor) and (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
             grad_norm = 0
 
@@ -1347,32 +1452,23 @@ class Trainer:
 
         # detach loss dict
         loss_dict_detached = self.detach_loss_dict(loss_dict, step_optimizer, optimizer_idx, grad_norm)
+
+        if self.aggressive_clean:
+            del loss_dict
+            torch.cuda.empty_cache()
+
         return outputs, loss_dict_detached, step_time
 
     def train_step(self, batch: Dict, batch_n_steps: int, step: int, loader_start_time: float) -> Tuple[Dict, Dict]:
-        """Perform a training step on a batch of inputs and log the process.
-
-        Args:
-            batch (Dict): Input batch.
-            batch_n_steps (int): Number of steps needed to complete an epoch. Needed for logging.
-            step (int): Current step number in this epoch.
-            loader_start_time (float): The time when the data loading is started. Needed for logging.
-
-        Returns:
-            Tuple[Dict, Dict]: Model outputs and losses.
-        """
+        """Perform a training step on a batch of inputs and log the process."""
         self.callbacks.on_train_step_start(self)
-        # format data
         batch = self.format_batch(batch)
         loader_time = time.time() - loader_start_time
 
-        # conteainers to hold model outputs and losses for each optimizer.
         outputs_per_optimizer = None
         loss_dict = {}
 
-        # OPTIMIZATION
-        if isimplemented(self.model, "optimize"):  # pylint: disable=too-many-nested-blocks
-            # custom optimize for the model
+        if isimplemented(self.model, "optimize"):
             step_time = time.time()
             device, dtype = self._get_autocast_args(self.config.mixed_precision, self.config.precision)
             with torch.autocast(device_type=device, dtype=dtype, enabled=self.config.mixed_precision):
@@ -1381,21 +1477,17 @@ class Trainer:
                     self,
                 )
             step_time = time.time() - step_time
-            # If None, skip the step
             if outputs is None:
                 return None, None
-            # TODO: find a way to log grad_norm for custom optimize
             loss_dict_new = self.detach_loss_dict(loss_dict_new, True, None, None)
             loss_dict.update(loss_dict_new)
+
         else:
-            # gradient accumulation
-            # TODO: grad accumulation for each optimizer
             step_optimizer = True
             if ((step + 1) % self.grad_accum_steps != 0) and (step + 1 != batch_n_steps):
                 step_optimizer = False
 
             if not isinstance(self.optimizer, list):
-                # auto training with a single optimizer
                 outputs, loss_dict_new, step_time = self.optimize(
                     batch,
                     self.model,
@@ -1409,12 +1501,10 @@ class Trainer:
                 )
                 loss_dict.update(loss_dict_new)
             else:
-                # auto training with multiple optimizers (e.g. GAN)
                 outputs_per_optimizer = [None] * len(self.optimizer)
                 total_step_time = 0
                 for idx, optimizer in enumerate(self.optimizer):
                     criterion = self.criterion
-                    # scaler = self.scaler[idx] if self.use_amp_scaler else None
                     scaler = self.scaler
                     scheduler = None
                     if self.scheduler is not None:
@@ -1431,12 +1521,8 @@ class Trainer:
                         step_optimizer=step_optimizer,
                         num_optimizers=len(self.optimizer),
                     )
-                    # skip the rest if the model returns None
                     total_step_time += step_time
                     outputs_per_optimizer[idx] = outputs
-                    # merge loss_dicts from each optimizer
-                    # rename duplicates with the optimizer idx
-                    # if None, model skipped this optimizer
                     if loss_dict_new is not None:
                         for k, v in loss_dict_new.items():
                             if k in loss_dict:
@@ -1447,25 +1533,20 @@ class Trainer:
 
                 outputs = outputs_per_optimizer
 
-                # clear any pesky gradients after gradient accumulation
                 if step_optimizer:
                     self.model.zero_grad(set_to_none=True)
 
-        # update avg runtime stats
         keep_avg_update = {}
         keep_avg_update["avg_loader_time"] = loader_time
         keep_avg_update["avg_step_time"] = step_time
         self.keep_avg_train.update_values(keep_avg_update)
 
-        # update avg loss stats
         update_eval_values = {}
         for key, value in loss_dict.items():
             update_eval_values["avg_" + key] = value
         self.keep_avg_train.update_values(update_eval_values)
 
-        # print training progress
         if self.total_steps_done % self.config.print_step == 0:
-            # log learning rates
             lrs = {}
             if isinstance(self.optimizer, list):
                 for idx, optimizer in enumerate(self.optimizer):
@@ -1479,7 +1560,6 @@ class Trainer:
                 current_lr = self.optimizer.param_groups[0]["lr"]
                 lrs = {"current_lr": current_lr}
 
-            # log run-time stats
             loss_dict.update(lrs)
             loss_dict.update(
                 {
@@ -1496,23 +1576,24 @@ class Trainer:
             )
 
         if self.args.rank == 0:
-            # Plot Training Iter Stats
-            # reduce TB load and don't log every step
             if self.total_steps_done % self.config.plot_step == 0:
                 self.dashboard_logger.train_step_stats(self.total_steps_done, loss_dict)
             if self.total_steps_done % self.config.save_step == 0 and self.total_steps_done != 0:
                 if self.config.save_checkpoints:
-                    # checkpoint the model
                     self.save_checkpoint()
 
             if self.total_steps_done % self.config.log_model_step == 0:
-                # log checkpoint as artifact
                 self.update_training_dashboard_logger(batch=batch, outputs=outputs)
 
             self.dashboard_logger.flush()
 
         self.total_steps_done += 1
         self.callbacks.on_train_step_end(self)
+
+        if self.aggressive_clean:
+            del batch
+            torch.cuda.empty_cache()
+
         return outputs, loss_dict
 
     def train_epoch(self) -> None:
@@ -1555,6 +1636,9 @@ class Trainer:
                 else:
                     self.model.train()
                 torch.set_grad_enabled(True)
+
+            if self.aggressive_clean:
+                torch.cuda.empty_cache()
 
 
         epoch_time = time.time() - epoch_start_time
@@ -1901,7 +1985,7 @@ class Trainer:
             except SystemExit:
                 os._exit(1)  # pylint: disable=protected-access
         except BaseException:  # pylint: disable=broad-except
-            remove_experiment_folder(self.output_path)
+            #remove_experiment_folder(self.output_path)
             traceback.print_exc()
             sys.exit(1)
 
@@ -1997,6 +2081,7 @@ class Trainer:
             f"epoch-{self.epochs_done}",
             f"step-{self.total_steps_done}",
         ]
+
         self.dashboard_logger.add_artifact(
             file_or_dir=self.output_path, name="checkpoint", artifact_type="model", aliases=aliases
         )
