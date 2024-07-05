@@ -19,7 +19,7 @@ class AllTalkTrainer(GPTTrainer):
         else:
             print(f"[FINETUNE] creating training sampler with {len(dataset)} samples")
             random_sampler = RandomSampler(dataset, replacement=True, num_samples=len(dataset))
-            batch_sampler = BatchSampler(random_sampler, batch_size=self.batch_size, drop_last=True)
+            batch_sampler = BatchSampler(random_sampler, batch_size=config.batch_size, drop_last=True)
         return batch_sampler
 
     def get_data_loader(
