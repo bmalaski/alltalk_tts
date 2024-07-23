@@ -22,6 +22,10 @@ import torchaudio
 import traceback
 import gradio as gr
 import pandas as pd
+from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
+from tokenizers.implementations import CharBPETokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
 from word2number import w2n
 from tqdm import tqdm
 from pathlib import Path
@@ -35,7 +39,7 @@ from metrics_logger import MetricsLogger
 from system.ft_tokenizer.tokenizer import multilingual_cleaners
 import importlib.metadata as metadata
 from packaging import version
-from tokenizers import ByteLevelBPETokenizer
+from tokenizers import ByteLevelBPETokenizer, Tokenizer
 from tokenizers.pre_tokenizers import Whitespace
 
 from trainer_alltalk.AllTalkTrainer import AllTalkTrainer
@@ -565,14 +569,54 @@ def format_audio_list(target_language, whisper_model, max_sample_length, eval_sp
 
     if create_bpe_tokenizer:
         print(f"Training BPE Tokenizer")
-        tokenizer = ByteLevelBPETokenizer(str(this_dir / base_path / "xttsv2_2.0.3" / "vocab.json"))
+        vocab_file = VoiceBpeTokenizer(str(this_dir / base_path / "xttsv2_2.0.3" / "vocab.json"))
+
+        for i in range(len(whisper_words)):
+            whisper_words[i] = vocab_file.preprocess_text(whisper_words[i], target_language)
+
+        trainer = BpeTrainer(special_tokens=['[STOP]', '[UNK]', '[SPACE]'], vocab_size=vocab_file.char_limits[target_language])
+        tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
-        tokenizer.add_tokens(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "[STOP]", "[SAPCE]"])
-        tokenizer.train_from_iterator(whisper_words, vocab_size=30000, show_progress=True, min_frequency=2, special_tokens=[
-            "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "[STOP]", "[SPACE]",
-        ])
-        # Save the tokenizer model
-        tokenizer.save(path=str(out_path / "bpe_tokenizer-vocab.json"), pretty=True)
+        tokenizer.train_from_iterator(whisper_words, trainer, length=len(whisper_words))
+        tokenizer.save(path=str(out_path / "trained-vocab.json"), pretty=True)
+
+        vocab_file = json.load(open(os.path.join(str(this_dir / base_path / "xttsv2_2.0.3" / "vocab.json")), 'r', encoding='utf-8'))
+        trained_file = json.load(open(os.path.join(str(out_path / "trained-vocab.json")), 'r', encoding='utf-8'))
+
+        vocab_array = vocab_file.get('model', {}).get('vocab', {})
+        vocab_array_trained = trained_file.get('model', {}).get('vocab', {})
+
+        combined_vocab_array = {}
+        for key, value in vocab_array.items():
+            combined_vocab_array[key] = value
+        for key, value in vocab_array_trained.items():
+            if key not in combined_vocab_array:
+                combined_vocab_array[key] = value
+
+        merges_array = vocab_file.get('model', {}).get('merges', [])
+        merges_trained = trained_file.get('model', {}).get('merges', [])
+        combined_merged_array = merges_array + merges_trained
+
+        vocab_file['model']['vocab'] = combined_vocab_array
+        vocab_file['model']['merges'] = combined_merged_array
+
+        # Save the updated first JSON file with pretty print
+        with open(str(out_path / "bpe_tokenizer-vocab.json"), 'w', encoding='utf-8') as file:
+            json.dump(vocab_file, file, indent=4, ensure_ascii=False)
+
+
+        # print(f"{voice_tokenizer}")
+        # print(f"{voice_tokenizer.tokenizer}")
+        # for i in range(len(whisper_words)):
+        #     whisper_words[i] = voice_tokenizer.preprocess_text(whisper_words[i], target_language)
+        # voice_tokenizer.tokenizer.train_from_iterator(whisper_words)
+        # # Save the tokenizer model
+        # voice_tokenizer.tokenizer.save(path=str(out_path / "bpe_tokenizer-vocab.json"), pretty=True)
+
+        # merge_tokenizer = VoiceBpeTokenizer(str(this_dir / base_path / "xttsv2_2.0.3" / "vocab.json"))
+        #
+        # merge_tokenizer.tokenizer.get_vocab()
+
 
     gradio_progress((4,4), "Finalizing")
 
@@ -831,6 +875,14 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
     lr_scheduler = None
     lr_scheduler_params = {}
 
+    # load training samples
+    train_samples, eval_samples = load_tts_samples(
+        DATASETS_CONFIG_LIST,
+        eval_split=True,
+        eval_split_max_size=256,
+        eval_split_size=0.01,
+    )
+
     if learning_rate_scheduler and learning_rate_scheduler != "None":
         lr_gamma_mapping = {
             1e-6: 0.9,
@@ -869,12 +921,17 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
                                    'max_momentum': 0.95, 'div_factor': 25.0, 'final_div_factor': 10000.0,
                                    'last_epoch': -1}
         elif lr_scheduler == "CosineAnnealingWarmRestarts":
+
+
+            batches = (len(train_samples) // batch_size)
+            total_steps = batches * (num_epochs - 1)
+            warmup_steps = int(total_steps * 0.05)
             if num_epochs < 4:
                 error_message = "For Cosine Annealing Warm Restarts, epochs must be at least 4. Please set a minimum of 4 epochs."
                 progress(1.0, desc=f"Error: {error_message}")
                 raise ValueError(error_message)
             #Set 4 learning rate restarts
-            lr_scheduler_params = {'T_0': int(num_epochs / 4), 'T_mult': 1, 'eta_min': 1e-6, 'last_epoch': -1}
+            lr_scheduler_params = {'T_0': int((total_steps - warmup_steps) / 6), 'T_mult': 1, 'eta_min': 1e-6, 'last_epoch': -1}
 
     optimizer_params = None
     optimizer_wd_only_on_weight = OPTIMIZER_WD_ONLY_ON_WEIGHTS
@@ -953,18 +1010,14 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
         lr_scheduler=lr_scheduler,
         # it was adjusted accordly for the new step scheme
         lr_scheduler_params=lr_scheduler_params,
-        test_sentences=[]
+        test_sentences=[],
+        scheduler_after_epoch=False,
+        allow_tf32=True
     )
     progress(0, desc="Model is currently training. See console for more information")
     # init the model from config
     model = AllTalkTrainer(config)
-    # load training samples
-    train_samples, eval_samples = load_tts_samples(
-        DATASETS_CONFIG_LIST,
-        eval_split=True,
-        eval_split_max_size=config.eval_split_max_size,
-        eval_split_size=config.eval_split_size,
-    )
+
 
     global c_logger
     c_logger = MetricsLogger()
@@ -987,7 +1040,7 @@ def train_gpt(language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv,
         c_logger=c_logger,
         warmup=warm_up,
         ds_enabled=True,
-        aggressive_clean=False
+        aggressive_clean=False,
     )
 
     if(disable_shared_memory):
@@ -1045,6 +1098,7 @@ def load_model(xtts_checkpoint, xtts_config, xtts_vocab):
     config = XttsConfig()
     config.load_json(xtts_config)
     XTTS_MODEL = Xtts.init_from_config(config)
+    print(f"model {XTTS_MODEL}")
     print("[FINETUNE] \033[94mStarting Step 3\033[0m Loading XTTS model!")
     XTTS_MODEL.load_checkpoint(config, checkpoint_path=xtts_checkpoint, vocab_path=xtts_vocab, use_deepspeed=False, speaker_file_path=xtts_speakers_pth)
     if torch.cuda.is_available():
@@ -1151,6 +1205,13 @@ def compact_custom_model(xtts_checkpoint_copy, folder_path, overwrite_existing):
     target_dir.mkdir(parents=True, exist_ok=True)
     # Remove dvae-related keys from checkpoint
     for key in list(checkpoint["model"].keys()):
+        #Needed for DeepSpeed
+        if key.startswith("_orig_mod."):
+            new_key = key.replace("_orig_mod.", "")
+            checkpoint["model"][new_key] = checkpoint["model"][key]
+            del checkpoint["model"][key]
+            key = new_key
+
         if "dvae" in key:
             del checkpoint["model"][key]
     torch.save(checkpoint, target_dir / "model.pth")
@@ -1610,7 +1671,9 @@ if __name__ == "__main__":
                             "large-v2",
                             "large",
                             "medium",
-                            "small"
+                            "small",
+                            "distil-large-v3",
+                            "distil-large-v2"
                         ],
                         scale=1,
                     )
@@ -1823,6 +1886,8 @@ if __name__ == "__main__":
                             ("1e-6", 1e-6),
                             ("5e-6", 5e-6),
                             ("1e-5", 1e-5),
+                            ("2e-5", 2e-5),
+                            ("3e-5", 3e-5),
                             ("5e-5", 5e-5),
                             ("1e-4", 1e-4),
                             ("5e-4", 5e-4),

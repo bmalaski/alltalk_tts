@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import sys
 import time
@@ -12,6 +13,8 @@ import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from inspect import signature
+
+from tqdm import tqdm
 from trainer.logging import ConsoleLogger, DummyLogger, logger_factory
 from typing import Callable, Dict, List, Tuple, Union
 
@@ -20,6 +23,7 @@ import torch
 import torch.distributed as dist
 from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTTrainerConfig, GPTArgs, XttsAudioConfig
 from coqpit import Coqpit
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP_th
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -41,6 +45,7 @@ from trainer.io import (
     load_fsspec,
     save_best_model,
     save_checkpoint,
+    keep_n_checkpoints,
 )
 from trainer.trainer_utils import (
     get_optimizer,
@@ -204,7 +209,7 @@ class TrainerConfig(Coqpit):
         },
     )
     allow_tf32: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": "A bool that controls whether TensorFloat-32 tensor cores may be used in matrix multiplications on Ampere or newer GPUs. Default to False."
         },
@@ -223,7 +228,7 @@ class TrainerConfig(Coqpit):
         },
     )
     training_seed: int = field(
-        default=54321,
+        default=random.randint(0, 2**32 - 1),
         metadata={"help": "Global seed for torch, random and numpy random number generator. Defaults to 54321"},
     )
 
@@ -527,15 +532,16 @@ class Trainer:
                 self.config.distributed_url,
             )
 
-        if self.use_cuda:
-            self.model.cuda()
-            if isinstance(self.criterion, list):
-                for criterion in self.criterion:
-                    if isinstance(criterion, torch.nn.Module):
-                        criterion.cuda()
-            else:
-                if isinstance(self.criterion, torch.nn.Module):
-                    self.criterion.cuda()
+        if not self.ds_enabled:
+            if self.use_cuda:
+                self.model.cuda()
+                if isinstance(self.criterion, list):
+                    for criterion in self.criterion:
+                        if isinstance(criterion, torch.nn.Module):
+                            criterion.cuda()
+                else:
+                    if isinstance(self.criterion, torch.nn.Module):
+                        self.criterion.cuda()
 
         # setup optimizer
         self.optimizer = self.get_optimizer(self.model, self.config)
@@ -571,8 +577,6 @@ class Trainer:
             )
             self.scaler = torch.cuda.amp.GradScaler()
 
-        self.model = torch.
-
 
         if self.ds_enabled:
             #We need ot setup the loaders first
@@ -600,32 +604,18 @@ class Trainer:
             os.environ["DS_ACCELERATOR"] = 'cuda'
             torch.distributed.init_process_group(backend='gloo', rank=0, world_size=1, init_method='env://')
             print(f"loader size: {len(self.train_loader)}")
-            batches = len(self.train_loader)
-            total_steps = batches * self.config.epochs
+
+
+            from einops._torch_specific import allow_ops_in_compiled_graph
+            allow_ops_in_compiled_graph()
+            self.model = torch.compile(model, backend="cudagraphs")
 
             if self.ds_config == {}:
                 self.ds_config = {
                     "train_micro_batch_size_per_gpu": self.config.batch_size,
                     "gradient_accumulation_steps": self.grad_accum_steps,
-                    "optimizer": {
-                        "type": "Adam",
-                        "params": {
-                            "lr": self.config.lr,
-                            "betas": [0.9, 0.999],
-                            "eps": 1e-8,
-                            "weight_decay": 3e-7
-                        }
-                    },
                     "flops_profiler": {
                         "enabled": False,
-                    },
-                    "scheduler": {
-                        "type": "WarmupCosineLR",
-                        "params": {
-                            "warmup_num_steps": batches // self.grad_accum_steps,
-                            "total_num_steps": total_steps // self.grad_accum_steps,
-                            "warmup_min_ratio": 1e-8
-                        }
                     },
                     "fp16": {
                         "enabled": False,
@@ -636,7 +626,7 @@ class Trainer:
                         "min_loss_scale": 1,
                     },
                     "zero_optimization": {
-                        "stage": 1,
+                        "stage": 2,
                         "offload_optimizer": {
                             "device": "cpu",
                             "pin_memory": True
@@ -668,50 +658,31 @@ class Trainer:
                     "steps_per_print": self.config.print_step,
                 }
 
-            print(self.model.named_modules())
-            print("_________________________________________________________________")
-
-            ds_logger = logging.getLogger("deepspeed")
-            ds_logger.setLevel(logging.INFO)
-
-            # Create file handler and set level to info
-            file_handler = logging.FileHandler(os.path.join(output_path, "deepspeed.txt"))
-            file_handler.setLevel(logging.INFO)
-
-            # Create formatter
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-            # Add formatter to file handler
-            file_handler.setFormatter(formatter)
-
-            # Add file handler to logger
-            ds_logger.addHandler(file_handler)
-
-            deepspeed.utils.logging.logger = ds_logger
-
-            self.model, self.optimizer, _ , self.scheduler = deepspeed.initialize(
+            self.optimizer = DeepSpeedCPUAdam(self.model.parameters(), lr=self.config.lr, **config.optimizer_params)
+            self.model, _, _, _ = deepspeed.initialize(
                 model=self.model,
-                model_parameters=self.model.parameters(),
                 config=self.ds_config,
-                dist_init_required=False
+                dist_init_required=False,
+                optimizer=self.optimizer
             )
 
-        else:
-            # setup scheduler
-            self.scheduler = self.get_scheduler(self.model, self.config, self.optimizer)
-            self.scheduler = self.restore_scheduler(
-                self.scheduler, self.args, self.config, self.restore_epoch, self.restore_step
-            )
+        batches = len(self.train_loader)
+        total_steps = batches * self.config.epochs
+        # setup scheduler
+        self.scheduler = self.get_scheduler(self.model, self.config, self.optimizer)
+        self.scheduler = self.restore_scheduler(
+            self.scheduler, self.args, self.config, self.restore_epoch, self.restore_step
+        )
 
-            if self.warmup:
-                warmup_scheduler = WarmUpScheduler(
-                    optimizer=self.optimizer,
-                    total_epochs=self.config.epochs,
-                    warmup_lr=1e-7,
-                    target_lr=self.config.lr,
-                    after_scheduler=self.scheduler
-                )
-                self.scheduler = warmup_scheduler
+        if self.warmup:
+            warmup_scheduler = WarmUpScheduler(
+                optimizer=self.optimizer,
+                total_epochs=total_steps,
+                warmup_lr=1e-7,
+                target_lr=self.config.lr,
+                after_scheduler=self.scheduler
+            )
+            self.scheduler = warmup_scheduler
 
         # DISTRIBUTED
         if self.use_pt_ddp:
@@ -1414,6 +1385,7 @@ class Trainer:
         elif self.ds_enabled:
             self.model.backward(loss_dict["loss"])
             self.model.step()
+            self.scheduler.step()
         else:
             if self.use_amp_scaler:
                 if self.use_apex:
@@ -1439,7 +1411,8 @@ class Trainer:
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.master_params(optimizer), grad_clip)
                     optimizer.step()
 
-            if scheduler is not None and update_lr_scheduler and not self.config.scheduler_after_epoch and step_optimizer and not self.ds_enabled:
+            if scheduler is not None and update_lr_scheduler and not self.config.scheduler_after_epoch and step_optimizer:
+                print("stepping")
                 scheduler.step()
 
             if step_optimizer and not self.ds_enabled:
@@ -1620,7 +1593,9 @@ class Trainer:
         loader_start_time = time.time()
         # TRAINING EPOCH -> iterate over the training samples
         batch_num_steps = len(self.train_loader)
-        for cur_step, batch in enumerate(self.train_loader):
+
+        for cur_step, batch in tqdm(iterable=enumerate(self.train_loader), total=len(self.train_loader),
+                                    desc=f"Training Epoch {self.epochs_done+1}"):
             outputs, _ = self.train_step(batch, batch_num_steps, cur_step, loader_start_time)
             if outputs is None:
                 logger.info(" [!] `train_step()` retuned `None` outputs. Skipping training step.")
@@ -1768,7 +1743,9 @@ class Trainer:
         loader_start_time = time.time()
         batch = None
         outputs = None
-        for cur_step, batch in enumerate(self.eval_loader):
+
+
+        for cur_step, batch in tqdm(iterable=enumerate(self.eval_loader), total=len(self.eval_loader), desc="Evaluating"):
             # format data
             batch = self.format_batch(batch)
             loader_time = time.time() - loader_start_time
@@ -1781,7 +1758,7 @@ class Trainer:
             loader_start_time = time.time()
         # plot epoch stats, artifacts and figures
         if self.args.rank == 0 and outputs is not None:
-            if hasattr(self.model, "module") and isimplemented(self.model.module, "eval_log"):
+            if hasattr(self.model, "module") and isimplemented(self.model.module, "eval_log") and not self.ds_enabled:
                 self.model.module.eval_log(
                     batch,
                     outputs,
@@ -2088,7 +2065,7 @@ class Trainer:
 
         # training visualizations
         if batch is not None and outputs is not None:
-            if hasattr(self.model, "module") and isimplemented(self.model.module, "train_log"):
+            if hasattr(self.model, "module") and isimplemented(self.model.module, "train_log") and not self.ds_enabled:
                 self.model.module.train_log(
                     batch,
                     outputs,
