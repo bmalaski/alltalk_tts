@@ -325,7 +325,7 @@ def create_temporary_file(folder, suffix=".wav"):
 
 
 
-def format_audio_list(target_language, whisper_model, max_sample_length, eval_split_number, speaker_name_input, create_bpe_tokenizer, gradio_progress=gr.Progress()):
+def format_audio_list(target_language, whisper_model, max_sample_length, eval_split_number, speaker_name_input, create_bpe_tokenizer, dataset_dir, gradio_progress=gr.Progress()):
     global validate_train_metadata_path, validate_eval_metadata_path, validate_audio_folder, validate_whisper_model, validate_target_language
     buffer = 0.3
     max_duration = float(max_sample_length)  # Ensure max_duration is a float
@@ -341,8 +341,8 @@ def format_audio_list(target_language, whisper_model, max_sample_length, eval_sp
     os.makedirs(temp_folder, exist_ok=True)
     audio_folder = os.path.join(out_path, "wavs")
     os.makedirs(audio_folder, exist_ok=True)
-    original_samples_folder = os.path.join(out_path, "..", "put-voice-samples-in-here")
-    print("[FINETUNE] Preparing Audio/Generating the dataset")
+    original_samples_folder = dataset_dir
+    print(f"[FINETUNE] Preparing Audio/Generating the dataset {original_samples_folder}")
 
     # Write the target language to lang.txt in the output directory
     lang_file_path = os.path.join(out_path, "lang.txt")
@@ -593,29 +593,16 @@ def format_audio_list(target_language, whisper_model, max_sample_length, eval_sp
             if key not in combined_vocab_array:
                 combined_vocab_array[key] = value
 
-        merges_array = vocab_file.get('model', {}).get('merges', [])
-        merges_trained = trained_file.get('model', {}).get('merges', [])
-        combined_merged_array = merges_array + merges_trained
+        # merges_array = vocab_file.get('model', {}).get('merges', [])
+        # merges_trained = trained_file.get('model', {}).get('merges', [])
+        # combined_merged_array = merges_array + merges_trained
+        #
+        # vocab_file['model']['merges'] = combined_merged_array
 
         vocab_file['model']['vocab'] = combined_vocab_array
-        vocab_file['model']['merges'] = combined_merged_array
 
-        # Save the updated first JSON file with pretty print
         with open(str(out_path / "bpe_tokenizer-vocab.json"), 'w', encoding='utf-8') as file:
             json.dump(vocab_file, file, indent=4, ensure_ascii=False)
-
-
-        # print(f"{voice_tokenizer}")
-        # print(f"{voice_tokenizer.tokenizer}")
-        # for i in range(len(whisper_words)):
-        #     whisper_words[i] = voice_tokenizer.preprocess_text(whisper_words[i], target_language)
-        # voice_tokenizer.tokenizer.train_from_iterator(whisper_words)
-        # # Save the tokenizer model
-        # voice_tokenizer.tokenizer.save(path=str(out_path / "bpe_tokenizer-vocab.json"), pretty=True)
-
-        # merge_tokenizer = VoiceBpeTokenizer(str(this_dir / base_path / "xttsv2_2.0.3" / "vocab.json"))
-        #
-        # merge_tokenizer.tokenizer.get_vocab()
 
 
     gradio_progress((4,4), "Finalizing")
@@ -1100,7 +1087,7 @@ def load_model(xtts_checkpoint, xtts_config, xtts_vocab):
     XTTS_MODEL = Xtts.init_from_config(config)
     print(f"model {XTTS_MODEL}")
     print("[FINETUNE] \033[94mStarting Step 3\033[0m Loading XTTS model!")
-    XTTS_MODEL.load_checkpoint(config, checkpoint_path=xtts_checkpoint, vocab_path=xtts_vocab, use_deepspeed=False, speaker_file_path=xtts_speakers_pth)
+    XTTS_MODEL.load_checkpoint(config, checkpoint_path=xtts_checkpoint, vocab_path=xtts_vocab, use_deepspeed=False, speaker_file_path=xtts_speakers_pth, strict=False)
     if torch.cuda.is_available():
         XTTS_MODEL.cuda()
 
@@ -1655,7 +1642,14 @@ if __name__ == "__main__":
                 audio_upload_button.click(upload_audio, inputs=audio_files_upload, outputs=output_text)
                 delete_audio_button.click(delete_existing_audio, outputs=output_text)
                 delete_dataset_button.click(delete_existing_training_data, outputs=output_text)
-                
+
+                with gr.Row():
+                    dataset_dir = gr.Textbox(
+                        label="Dataset Directory",
+                        value=str(audio_folder),
+                        visible=True,
+                        scale=1,
+                    )
                 with gr.Row():
                     speaker_name_input = gr.Textbox(
                         label="Training Project Name",
@@ -1732,15 +1726,15 @@ if __name__ == "__main__":
 
                 prompt_compute_btn = gr.Button(value="Step 1 - Create dataset")
             
-                def preprocess_dataset(language, whisper_model, max_sample_length, eval_split_number, speaker_name_input, create_bpe_tokenizer, progress=gr.Progress()):
+                def preprocess_dataset(language, whisper_model, max_sample_length, eval_split_number, speaker_name_input, create_bpe_tokenizer, dataset_dir, progress=gr.Progress()):
                     clear_gpu_cache()
-                    test_for_audio_files = [file for file in os.listdir(audio_folder) if any(file.lower().endswith(ext) for ext in ['.wav', '.mp3', '.flac'])]
+                    test_for_audio_files = [file for file in os.listdir(dataset_dir) if any(file.lower().endswith(ext) for ext in ['.wav', '.mp3', '.flac'])]
                     if not test_for_audio_files:
-                        return "I cannot find any mp3, wav or flac files in the folder called 'put-voice-samples-in-here'", "", ""
+                        return f"I cannot find any mp3, wav or flac files in the folder called '{dataset_dir}'", "", ""
                     else:
                         try:
 
-                            train_meta, eval_meta, audio_total_size = format_audio_list(target_language=language, whisper_model=whisper_model, max_sample_length=max_sample_length, eval_split_number=eval_split_number, speaker_name_input=speaker_name_input, create_bpe_tokenizer=create_bpe_tokenizer, gradio_progress=progress)
+                            train_meta, eval_meta, audio_total_size = format_audio_list(target_language=language, whisper_model=whisper_model, max_sample_length=max_sample_length, eval_split_number=eval_split_number, speaker_name_input=speaker_name_input, create_bpe_tokenizer=create_bpe_tokenizer, dataset_dir=dataset_dir, gradio_progress=progress)
                         except:
                             traceback.print_exc()
                             error = traceback.format_exc()
@@ -2313,6 +2307,7 @@ if __name__ == "__main__":
             final_progress_data = gr.Label(
                 label="Progress:"
             )
+
             with gr.Row():
                 xtts_checkpoint_copy = gr.Dropdown(
                     [str(file) for file in xtts_checkpoint_files],
@@ -2353,7 +2348,8 @@ if __name__ == "__main__":
                     max_sample_length,
                     eval_split_number,
                     speaker_name_input,
-                    create_bpe_tokenizer
+                    create_bpe_tokenizer,
+                    dataset_dir
                 ],
                 outputs=[
                     progress_data,
