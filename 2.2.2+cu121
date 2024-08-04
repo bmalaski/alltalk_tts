@@ -1,0 +1,34 @@
+Looking in indexes: https://pypi.org/simple, https://download.pytorch.org/whl/cu121
+Collecting torch==2.2.2+cu121
+  Using cached https://download.pytorch.org/whl/cu121/torch-2.2.2%2Bcu121-cp311-cp311-win_amd64.whl (2454.8 MB)
+Collecting torchaudio
+  Using cached https://download.pytorch.org/whl/cu121/torchaudio-2.3.1%2Bcu121-cp311-cp311-win_amd64.whl (4.1 MB)
+Collecting filelock (from torch==2.2.2+cu121)
+  Using cached filelock-3.14.0-py3-none-any.whl.metadata (2.8 kB)
+Collecting typing-extensions>=4.8.0 (from torch==2.2.2+cu121)
+  Using cached typing_extensions-4.12.1-py3-none-any.whl.metadata (3.0 kB)
+Collecting sympy (from torch==2.2.2+cu121)
+  Using cached sympy-1.12.1-py3-none-any.whl.metadata (12 kB)
+Collecting networkx (from torch==2.2.2+cu121)
+  Using cached networkx-3.3-py3-none-any.whl.metadata (5.1 kB)
+Collecting jinja2 (from torch==2.2.2+cu121)
+  Using cached jinja2-3.1.4-py3-none-any.whl.metadata (2.6 kB)
+Collecting fsspec (from torch==2.2.2+cu121)
+  Using cached fsspec-2024.6.0-py3-none-any.whl.metadata (11 kB)
+INFO: pip is looking at multiple versions of torchaudio to determine which version is compatible with other requirements. This could take a while.
+Collecting torchaudio
+  Using cached https://download.pytorch.org/whl/cu121/torchaudio-2.3.0%2Bcu121-cp311-cp311-win_amd64.whl (4.1 MB)
+  Using cached torchaudio-2.3.0-cp311-cp311-win_amd64.whl.metadata (6.4 kB)
+  Using cached https://download.pytorch.org/whl/cu121/torchaudio-2.2.2%2Bcu121-cp311-cp311-win_amd64.whl (4.1 MB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch==2.2.2+cu121)
+  Using cached https://download.pytorch.org/whl/MarkupSafe-2.1.5-cp311-cp311-win_amd64.whl (17 kB)
+Collecting mpmath<1.4.0,>=1.1.0 (from sympy->torch==2.2.2+cu121)
+  Using cached https://download.pytorch.org/whl/mpmath-1.3.0-py3-none-any.whl (536 kB)
+Using cached typing_extensions-4.12.1-py3-none-any.whl (37 kB)
+Using cached filelock-3.14.0-py3-none-any.whl (12 kB)
+Using cached fsspec-2024.6.0-py3-none-any.whl (176 kB)
+Using cached jinja2-3.1.4-py3-none-any.whl (133 kB)
+Using cached networkx-3.3-py3-none-any.whl (1.7 MB)
+Using cached sympy-1.12.1-py3-none-any.whl (5.7 MB)
+Installing collected packages: mpmath, typing-extensions, sympy, networkx, MarkupSafe, fsspec, filelock, jinja2, torch, torchaudio
+Successfully installed MarkupSafe-2.1.5 filelock-3.14.0 fsspec-2024.6.0 jinja2-3.1.4 mpmath-1.3.0 networkx-3.3 sympy-1.12.1 torch-2.2.2+cu121 torchaudio-2.2.2+cu121 typing-extensions-4.12.1

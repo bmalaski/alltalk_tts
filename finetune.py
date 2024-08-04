@@ -589,9 +589,12 @@ def format_audio_list(target_language, whisper_model, max_sample_length, eval_sp
         combined_vocab_array = {}
         for key, value in vocab_array.items():
             combined_vocab_array[key] = value
+
+        next_index = int(len(vocab_array))
         for key, value in vocab_array_trained.items():
             if key not in combined_vocab_array:
-                combined_vocab_array[key] = value
+                combined_vocab_array[key] = next_index
+                next_index += 1
 
         # merges_array = vocab_file.get('model', {}).get('merges', [])
         # merges_trained = trained_file.get('model', {}).get('merges', [])

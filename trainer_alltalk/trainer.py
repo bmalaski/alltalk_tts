@@ -606,9 +606,9 @@ class Trainer:
             print(f"loader size: {len(self.train_loader)}")
 
 
-            from einops._torch_specific import allow_ops_in_compiled_graph
-            allow_ops_in_compiled_graph()
-            self.model = torch.compile(model, backend="cudagraphs")
+            # from einops._torch_specific import allow_ops_in_compiled_graph
+            # allow_ops_in_compiled_graph()
+            # self.model = torch.compile(model, backend="cudagraphs")
 
             if self.ds_config == {}:
                 self.ds_config = {

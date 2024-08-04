@@ -128,6 +128,9 @@ class MetricsLogger(ConsoleLogger):
             if show_loss:
                 ax2.plot(*zip(*self.loss), color='green', linestyle='-', label='Loss')
                 ax2.fill_between(*zip(*self.loss), color='lightgreen', alpha=0.1)
+                min_val = min(point[1] for point in self.loss)
+                max_val = max(point[1] for point in self.loss)
+                ax2.set_ylim(min_val - 0.1, max_val + 0.1)
             if show_loss_text_ce:
                 ax2.plot(*zip(*self.loss_text_ce), color='red', linestyle='-', label='Loss Text')
                 ax2.fill_between(*zip(*self.loss_text_ce), color='lightcoral', alpha=0.1)
@@ -145,6 +148,9 @@ class MetricsLogger(ConsoleLogger):
             if show_loss:
                 ax1.plot(*zip(*self.avg_loss), color='green', linestyle='-', label='Avg Loss')
                 ax1.fill_between(*zip(*self.avg_loss), color='lightgreen', alpha=0.1)
+                min_val = min(point[1] for point in self.avg_loss)
+                max_val = max(point[1] for point in self.avg_loss)
+                ax1.set_ylim(min_val - 0.1, max_val + 0.1)
             if show_loss_text_ce:
                 ax1.plot(*zip(*self.avg_loss_text_ce), color='red', linestyle='-', label='Avg Loss Text')
                 ax1.fill_between(*zip(*self.avg_loss_text_ce), color='lightcoral', alpha=0.1)

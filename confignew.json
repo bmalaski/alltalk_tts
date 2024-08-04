@@ -4,7 +4,7 @@
     "gradio_interface": true,
     "output_folder": "outputs",
     "gradio_port_number": 7852,
-    "firstrun_model": true,
+    "firstrun_model": false,
     "firstrun_splash": true,
     "launch_gradio": true,
     "transcode_audio_format": "Disabled",
@@ -13,20 +13,20 @@
         "class": "gradio/base"
     },
     "rvc_settings": {
-        "rvc_enabled": false,
-        "rvc_char_model_file": "Disabled",
-        "rvc_narr_model_file": "Disabled",
-        "split_audio": true,
-        "autotune": false,
+        "rvc_enabled": true,
+        "rvc_char_model_file": "nate.pth",
+        "rvc_narr_model_file": "nate.pth",
+        "split_audio": false,
+        "autotune": true,
         "pitch": 0,
         "filter_radius": 3,
         "index_rate": 0.75,
-        "rms_mix_rate": 1,
+        "rms_mix_rate": 0.85,
         "protect": 0.5,
-        "hop_length": 130,
-        "f0method": "fcpe",
+        "hop_length": 1,
+        "f0method": "rmvpe",
         "embedder_model": "hubert",
-        "training_data_size": 45000
+        "training_data_size": 100000
     },
     "tgwui": {
         "tgwui_activate_tts": true,

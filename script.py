@@ -8,6 +8,8 @@ import random
 import atexit
 import signal
 import logging
+import traceback
+
 import requests
 import platform
 import subprocess
@@ -218,7 +220,8 @@ def run_firsttime_script():
     except subprocess.CalledProcessError as e:
         print(f"Error occurred while running the script: {e}")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        traceback.print_exc()
+        print(f"An unexpected error occurred: ", e)
 
 # Call the function to run the startup script
 run_firsttime_script()
